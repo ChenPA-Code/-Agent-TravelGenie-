@@ -1,0 +1,238 @@
+import asyncio
+import random
+from dataclasses import dataclass, field
+from typing import List, Dict, Any
+from enum import Enum
+
+# -------------------- 模拟工具与数据 --------------------
+class BudgetLevel(Enum):
+    LOW = 1
+    MEDIUM = 2
+    HIGH = 3
+
+@dataclass
+class Attraction:
+    name: str
+    city: str
+    type: str          # nature, culture, food
+    intensity: int     # 1-5 体力强度
+    cost: float
+    duration: float    # 小时
+
+# 模拟景点库
+ATTRACTIONS = [
+    Attraction("洱海", "大理", "nature", 2, 0, 3),
+    Attraction("苍山", "大理", "nature", 4, 80, 5),
+    Attraction("大理古城", "大理", "culture", 1, 0, 2),
+    Attraction("丽江古城", "丽江", "culture", 1, 0, 2.5),
+    Attraction("玉龙雪山", "丽江", "nature", 5, 220, 6),
+    Attraction("泸沽湖", "丽江", "nature", 3, 100, 8),
+    Attraction("香格里拉", "迪庆", "nature", 4, 150, 6),
+    Attraction("松赞林寺", "迪庆", "culture", 2, 90, 2),
+    Attraction("普达措", "迪庆", "nature", 3, 100, 5),
+]
+
+@dataclass
+class TripPlan:
+    days: List[Dict[str, Any]] = field(default_factory=list)
+    total_cost: float = 0.0
+
+# -------------------- Agent基类 --------------------
+class BaseAgent:
+    def __init__(self, name: str, inbox: asyncio.Queue, outbox: asyncio.Queue):
+        self.name = name
+        self.inbox = inbox
+        self.outbox = outbox
+
+    async def send(self, message: Dict):
+        await self.outbox.put(message)
+
+    async def receive(self) -> Dict:
+        return await self.inbox.get()
+
+    async def run(self):
+        raise NotImplementedError
+
+# -------------------- 需求解析 Agent --------------------
+class RequirementsAnalyst(BaseAgent):
+    async def run(self):
+        msg = await self.receive()
+        raw = msg["user_input"]
+        # 模拟LLM解析：规则+关键词
+        days = 7
+        if "5天" in raw: days = 5
+        elif "7天" in raw: days = 7
+        city_keywords = {"大理": "大理", "丽江": "丽江", "香格里拉": "迪庆", "云南": None}
+        cities = []
+        for kw, city in city_keywords.items():
+            if kw in raw and city:
+                cities.append(city)
+        if not cities:
+            cities = ["大理", "丽江"]  # 默认
+
+        intensity = "high"
+        if "轻松" in raw or "不累" in raw or "老人" in raw:
+            intensity = "low"
+
+        budget = 5000
+        if "3000" in raw: budget = 3000
+        elif "5000" in raw: budget = 5000
+
+        temp = msg.get("temperature", "warm")
+        parsed = {
+            "days": days,
+            "cities": cities,
+            "intensity": intensity,
+            "budget": budget,
+            "preferences": ["nature"] if "自然" in raw else ["culture"],
+            "travelers": "family_elder" if "老人" in raw else "solo",
+            "weather": temp
+        }
+        print(f"[{self.name}] 需求解析完成: {parsed}")
+        await self.send({"type": "structured_req", "data": parsed, "next": "KnowledgeRetriever"})
+
+# -------------------- 知识检索 Agent --------------------
+class KnowledgeRetriever(BaseAgent):
+    async def run(self):
+        msg = await self.receive()
+        req = msg["data"]
+        cities = req["cities"]
+        intensity_limit = 3 if req["intensity"] == "low" else 5
+        candidates = [a for a in ATTRACTIONS if a.city in cities and a.intensity <= intensity_limit]
+        print(f"[{self.name}] 检索到 {len(candidates)} 个候选景点")
+        await self.send({"type": "candidates", "data": candidates, "req": req, "next": "ItineraryPlanner"})
+
+# -------------------- 路线生成 Agent --------------------
+class ItineraryPlanner(BaseAgent):
+    async def run(self):
+        msg = await self.receive()
+        candidates = msg["data"]
+        req = msg["req"]
+        days = req["days"]
+        # 简单贪心 + 每日活动时长约束
+        daily_limit_hours = 5 if req["intensity"] == "low" else 8
+        plan_days = []
+        remaining = sorted(candidates, key=lambda x: x.intensity)  # 先排轻松的
+        for d in range(days):
+            day_plan = []
+            hours = 0
+            for attr in list(remaining):
+                if hours + attr.duration <= daily_limit_hours:
+                    day_plan.append(attr)
+                    hours += attr.duration
+                    remaining.remove(attr)
+                if hours >= daily_limit_hours - 0.5:
+                    break
+            plan_days.append({"day": d+1, "activities": [a.name for a in day_plan], "hours": hours})
+        trip_plan = TripPlan(days=plan_days)
+        # 计算粗略费用
+        total_cost = sum(a.cost for day in plan_days for a in ATTRACTIONS if a.name in day["activities"])
+        # 添加基础住宿交通估算（每人每天200）
+        total_cost += days * 200
+        trip_plan.total_cost = total_cost
+        print(f"[{self.name}] 初始行程生成，总估算 {total_cost:.1f} 元")
+        await self.send({"type": "initial_plan", "data": trip_plan, "req": req, "candidates": candidates, "next": "BudgetOptimizer"})
+
+# -------------------- 预算优化 Agent --------------------
+class BudgetOptimizer(BaseAgent):
+    async def run(self):
+        msg = await self.receive()
+        plan = msg["data"]
+        req = msg["req"]
+        budget = req["budget"]
+        print(f"[{self.name}] 开始预算检查，预算上限 {budget}，当前花费 {plan.total_cost:.1f}")
+        if plan.total_cost <= budget:
+            print(f"[{self.name}] 预算符合，无需优化")
+            await self.send({"type": "optimized_plan", "data": plan, "req": req, "next": "ReflectionCoordinator"})
+            return
+        # 尝试替换昂贵景点为免费/低价同类景点（模拟）
+        for day in plan.days:
+            for act_name in day["activities"]:
+                attr = next(a for a in ATTRACTIONS if a.name == act_name)
+                if attr.cost > 100:
+                    # 替换为同城低价自然景点
+                    cheap = [a for a in ATTRACTIONS if a.city == attr.city and a.type == attr.type and a.cost < 50]
+                    if cheap:
+                        day["activities"].remove(act_name)
+                        day["activities"].append(cheap[0].name)
+                        plan.total_cost -= (attr.cost - cheap[0].cost)
+                        plan.total_cost = round(plan.total_cost, 2)
+                        print(f"[{self.name}] 将 {act_name}({attr.cost}) 替换为 {cheap[0].name}({cheap[0].cost})")
+        await self.send({"type": "optimized_plan", "data": plan, "req": req, "next": "ReflectionCoordinator"})
+
+# -------------------- 反思协调 Agent（长链推理核心） --------------------
+class ReflectionCoordinator(BaseAgent):
+    counter = 0
+    async def run(self):
+        msg = await self.receive()
+        plan = msg["data"]
+        req = msg["req"]
+        # 检查每日活动量是否过空或过满
+        reflection = ""
+        for day in plan.days:
+            if day["hours"] < 2:
+                reflection += f"Day{day['day']}安排过少；"
+            elif day["hours"] > 7 and req["intensity"] == "low":
+                reflection += f"Day{day['day']}对老人强度偏高；"
+        if reflection:
+            print(f"[{self.name}] 反思发现问题: {reflection}，触发重规划")
+            # 简化：直接调整但维持当前计划（实际会发回planner）
+            # 此处模拟调整
+            await self.send({"type": "final_plan", "data": plan, "req": req, "reflection": reflection, "next": "BookingAgent"})
+        else:
+            print(f"[{self.name}] 行程合理，通过反思")
+            await self.send({"type": "final_plan", "data": plan, "req": req, "next": "BookingAgent"})
+
+# -------------------- 预订执行 Agent --------------------
+class BookingAgent(BaseAgent):
+    async def run(self):
+        msg = await self.receive()
+        plan = msg["data"]
+        print(f"[{self.name}] 开始预订流程...")
+        for day in plan.days:
+            for act in day["activities"]:
+                # 模拟预订
+                print(f"  预订 {act} 门票成功，确认码: B{random.randint(1000,9999)}")
+        hotel_id = random.randint(5000, 9999)
+        print(f"  预订酒店成功，确认码: H{hotel_id}")
+        print("✅ 全部预订完成！")
+        # 可推送行程总结
+        print("\n===== 最终行程 =====")
+        for day in plan.days:
+            print(f"Day {day['day']}: {', '.join(day['activities'])} (活动{day['hours']}h)")
+        print(f"总费用: {plan.total_cost:.1f} 元/人")
+        await self.send({"type": "done"})
+
+# -------------------- 协调运行器 --------------------
+async def run_pipeline(user_input: str):
+    # 创建消息队列
+    q1 = asyncio.Queue()
+    q2 = asyncio.Queue()
+    q3 = asyncio.Queue()
+    q4 = asyncio.Queue()
+    q5 = asyncio.Queue()
+
+    agents = [
+        RequirementsAnalyst("需求解析", q1, q2),
+        KnowledgeRetriever("知识检索", q2, q3),
+        ItineraryPlanner("路线生成", q3, q4),
+        BudgetOptimizer("预算优化", q4, q5),
+        ReflectionCoordinator("反思协调", q5, q1),  # 环路反馈
+        BookingAgent("预订执行", q1, q2),  # 实际预订会继续传递
+    ]
+
+    # 注入初始用户请求
+    await q1.put({"user_input": user_input, "temperature": "凉爽"})
+
+    # 启动所有Agent协程
+    tasks = [asyncio.create_task(agent.run()) for agent in agents]
+    # 由于预订完成后，我们需终止，否则会死锁在 BookingAgent 的 receive 上
+    # 简单设置超时等待
+    try:
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=2.0)
+    except asyncio.TimeoutError:
+        pass
+
+if __name__ == "__main__":
+    test_input = "十一带父母去云南大理和丽江，7天，不想太累，每人预算4500，喜欢自然风光"
+    asyncio.run(run_pipeline(test_input))
